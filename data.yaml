@@ -1,0 +1,13 @@
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 1
+names: ['plastic-bag']
+
+roboflow:
+  workspace: noobokay
+  project: plastic-bag-act4g-dndwo
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/noobokay/plastic-bag-act4g-dndwo/dataset/1
