@@ -1,224 +1,325 @@
 import cv2
 import numpy as np
-from ultralytics import YOLO
 import time
+import threading
 from collections import defaultdict
+from pathlib import Path
+from typing import List, Dict, Optional
+from inference_sdk import InferenceHTTPClient
+from inference_sdk.http.entities import InferenceConfiguration
 
-class PlasticBagDetector:
-    def __init__(self, model_path='runs/detect/plastic_bag_detector/weights/best.pt'):
+class PlasticBagDetectorV2:
+    def __init__(self):
         """
-        Initialize the plastic bag detector with trained YOLOv11 model
+        Initialize the plastic bag detector with Roboflow Inference client.
+        Optimized for smooth camera usage using threading.
         """
-        try:
-            self.model = YOLO(model_path)
-            print(f"Model loaded from: {model_path}")
-        except Exception as e:
-            print(f"Error loading model: {e}")
-            print("Falling back to pretrained YOLOv11n for demonstration")
-            self.model = YOLO('yolo11n.pt')
+        self.api_key = "BcIJpIJ9IgDbVzINZUpT"
+        self.model_id = "plastic-bag-act4g-dndwo/1"
+        
+        self.client = InferenceHTTPClient(
+            api_url="https://serverless.roboflow.com",
+            api_key=self.api_key
+        )
+        
+        # Inference settings
+        self.confidence_threshold = 0.70  # Increased default to reduce false positives
+        self.iou_threshold = 0.50
+        
+        # Configure inference settings
+        self._update_config()
 
-        # For tracking multiple bags
-        self.tracked_objects = defaultdict(list)
-        self.next_id = 0
+        # Threading variables
+        self.stop_event = threading.Event()
+        self.frame_lock = threading.Lock()
+        self.pred_lock = threading.Lock()
+        
+        self.latest_frame: Optional[np.ndarray] = None
+        self.latest_predictions: List[Dict] = []
+        self.inference_active = False
+        
+        # Performance stats
+        self.fps = 0
+        self.inference_fps = 0
 
-        # Detection parameters
-        self.confidence_threshold = 0.5
-        self.iou_threshold = 0.45
+    def _update_config(self):
+        """Update the inference configuration."""
+        config = InferenceConfiguration(
+            confidence_threshold=self.confidence_threshold,
+            iou_threshold=self.iou_threshold
+        )
+        self.client.configure(config)
 
-    def detect_plastic_bags(self, frame):
-        """
-        Detect plastic bags in a frame and return annotated frame with bounding boxes
-        """
-        # Run YOLOv11 inference
-        results = self.model(frame, conf=self.confidence_threshold, iou=self.iou_threshold)
+    def _draw_predictions(self, frame: np.ndarray, predictions: List[Dict]) -> np.ndarray:
+        """Overlay detections on a frame."""
+        annotated = frame.copy()
+        height, width = annotated.shape[:2]
 
-        annotated_frame = frame.copy()
-        detection_count = 0
+        # Filter predictions by current confidence threshold again, just in case
+        valid_predictions = [p for p in predictions if p["confidence"] >= self.confidence_threshold]
 
-        # Process detections
-        for result in results:
-            boxes = result.boxes
-            if boxes is not None:
-                for box in boxes:
-                    # Get bounding box coordinates
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    confidence = box.conf[0].cpu().numpy()
-                    class_id = int(box.cls[0].cpu().numpy())
+        for prediction in valid_predictions:
+            # Check if coordinates are normalized (0-1) or absolute
+            # The SDK usually returns what the model outputs. 
+            # If the previous code scaled them, we should check.
+            # We'll assume normalized if values are small, but safe to just use the logic from v1
+            
+            x = prediction["x"]
+            y = prediction["y"]
+            w = prediction["width"]
+            h = prediction["height"]
+            
+            # Heuristic to check if normalized. If x < 2 (and width is large), it's likely normalized.
+            if x < 2 and width > 100: 
+                x *= width
+                y *= height
+                w *= width
+                h *= height
 
-                    # Only process plastic bag detections (class 0)
-                    if class_id == 0:  # plastic-bag class
-                        detection_count += 1
+            confidence = prediction["confidence"]
+            label = prediction.get("class", "plastic-bag")
 
-                        # Convert to integers
-                        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            half_w, half_h = w / 2, h / 2
+            x1, y1 = int(x - half_w), int(y - half_h)
+            x2, y2 = int(x + half_w), int(y + half_h)
 
-                        # Draw bounding box
-                        color = (0, 255, 0)  # Green for plastic bags
-                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+            color = (0, 255, 0) # Green
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
 
-                        # Add label with confidence
-                        label = f'Plastic Bag: {confidence:.2f}'
-                        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+            label_text = f"{label}: {confidence:.2f}"
+            label_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
 
-                        # Draw label background
-                        cv2.rectangle(annotated_frame,
-                                    (x1, y1 - label_size[1] - 10),
-                                    (x1 + label_size[0], y1),
-                                    color, -1)
+            cv2.rectangle(
+                annotated,
+                (x1, y1 - label_size[1] - 10),
+                (x1 + label_size[0] + 10, y1),
+                color,
+                -1
+            )
+            cv2.putText(
+                annotated,
+                label_text,
+                (x1 + 5, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 0),
+                2
+            )
 
-                        # Draw label text
-                        cv2.putText(annotated_frame, label,
-                                  (x1, y1 - 5),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        # Draw stats
+        cv2.putText(annotated, f'FPS: {self.fps:.1f}', (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(annotated, f'Inf FPS: {self.inference_fps:.1f}', (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        # Draw Confidence Threshold
+        cv2.putText(annotated, f'Conf Thresh: {self.confidence_threshold:.2f} (+/- to adj)', (10, 90), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        
+        bag_count = len(valid_predictions)
+        status_color = (0, 0, 255) if bag_count > 0 else (0, 255, 0)
+        status_text = f"PLASTIC DETECTED: {bag_count}" if bag_count > 0 else "NO PLASTIC"
+        
+        cv2.putText(annotated, status_text, (10, height - 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
 
-        # Add detection count overlay
-        cv2.putText(annotated_frame, f'Bags detected: {detection_count}',
-                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        return annotated
 
-        return annotated_frame, detection_count
+    def _inference_loop(self):
+        """Background thread for running inference."""
+        last_inference_time = time.time()
+        frame_count = 0
+        
+        while not self.stop_event.is_set():
+            frame_to_process = None
+            
+            # Get latest frame safely
+            with self.frame_lock:
+                if self.latest_frame is not None:
+                    frame_to_process = self.latest_frame.copy()
+            
+            if frame_to_process is not None:
+                try:
+                    start_time = time.time()
+                    
+                    # Run inference
+                    result = self.client.infer(frame_to_process, model_id=self.model_id)
+                    predictions = result.get("predictions", [])
+                    
+                    # Update predictions safely
+                    with self.pred_lock:
+                        self.latest_predictions = predictions
+                    
+                    # Calculate Inference FPS
+                    frame_count += 1
+                    if time.time() - last_inference_time >= 1.0:
+                        self.inference_fps = frame_count / (time.time() - last_inference_time)
+                        frame_count = 0
+                        last_inference_time = time.time()
+                        
+                except Exception as e:
+                    print(f"Inference error: {e}")
+                    time.sleep(0.5) # Back off on error
+            else:
+                time.sleep(0.01)
 
     def run_webcam_detection(self):
-        """
-        Run real-time plastic bag detection using webcam
-        """
-        print("Starting webcam detection...")
-        print("Press 'q' to quit, 's' to save current frame")
-
-        # Initialize webcam
+        """Run smooth webcam detection using threading."""
+        print("Starting smooth webcam detection...")
+        print("Controls: 'q' to quit, 's' to save frame")
+        
         cap = cv2.VideoCapture(0)
-
         if not cap.isOpened():
             print("Error: Could not open webcam")
             return
 
-        # Set webcam resolution
+        # Set resolution
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-        fps_counter = 0
+        # Start inference thread
+        self.stop_event.clear()
+        inference_thread = threading.Thread(target=self._inference_loop, daemon=True)
+        inference_thread.start()
+
         fps_start_time = time.time()
-        current_fps = 0
+        fps_counter = 0
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("Error: Could not read frame")
-                break
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    print("Error: Could not read frame")
+                    break
 
-            # Detect plastic bags
-            annotated_frame, detection_count = self.detect_plastic_bags(frame)
+                # Update latest frame for inference thread
+                with self.frame_lock:
+                    self.latest_frame = frame
 
-            # Calculate FPS
-            fps_counter += 1
-            if fps_counter >= 10:
-                current_fps = fps_counter / (time.time() - fps_start_time)
-                fps_counter = 0
-                fps_start_time = time.time()
+                # Get latest predictions to draw
+                current_predictions = []
+                with self.pred_lock:
+                    current_predictions = self.latest_predictions
 
-            # Add FPS overlay
-            cv2.putText(annotated_frame, f'FPS: {current_fps:.1f}',
-                       (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                # Draw predictions
+                annotated_frame = self._draw_predictions(frame, current_predictions)
 
-            # Display the resulting frame
-            cv2.imshow('Plastic Bag Detection', annotated_frame)
+                # Calculate Display FPS
+                fps_counter += 1
+                if time.time() - fps_start_time >= 1.0:
+                    self.fps = fps_counter / (time.time() - fps_start_time)
+                    fps_counter = 0
+                    fps_start_time = time.time()
 
-            # Handle key presses
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('s'):
-                # Save current frame
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                filename = f'plastic_bag_detection_{timestamp}.jpg'
-                cv2.imwrite(filename, annotated_frame)
-                print(f"Frame saved as {filename}")
+                cv2.imshow('Plastic Bag Detection V2', annotated_frame)
 
-        # Release webcam and close windows
-        cap.release()
-        cv2.destroyAllWindows()
-        print("Webcam detection stopped")
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord('s'):
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    filename = f'plastic_bag_v2_{timestamp}.jpg'
+                    cv2.imwrite(filename, annotated_frame)
+                    print(f"Frame saved as {filename}")
+                elif key == ord('+') or key == ord('='):
+                    self.confidence_threshold = min(1.0, self.confidence_threshold + 0.05)
+                    self._update_config()
+                    print(f"Confidence threshold increased to {self.confidence_threshold:.2f}")
+                elif key == ord('-') or key == ord('_'):
+                    self.confidence_threshold = max(0.1, self.confidence_threshold - 0.05)
+                    self._update_config()
+                    print(f"Confidence threshold decreased to {self.confidence_threshold:.2f}")
+
+        finally:
+            self.stop_event.set()
+            inference_thread.join(timeout=1.0)
+            cap.release()
+            cv2.destroyAllWindows()
+            print("Detection stopped")
 
     def run_video_detection(self, video_path):
-        """
-        Run plastic bag detection on video file
-        """
+        """Run detection on video file (synchronous for accuracy)."""
         print(f"Processing video: {video_path}")
-
         cap = cv2.VideoCapture(video_path)
-
         if not cap.isOpened():
-            print(f"Error: Could not open video file {video_path}")
+            print(f"Error: Could not open video {video_path}")
             return
 
-        # Get video properties
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        # Create output video writer
-        output_path = f'output_{video_path}'
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-        frame_count = 0
-        total_detections = 0
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        
+        output_path = f'output_v2_{Path(video_path).name}'
+        out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
+            
+            # Synchronous inference for video files
+            try:
+                result = self.client.infer(frame, model_id=self.model_id)
+                predictions = result.get("predictions", [])
+                annotated = self._draw_predictions(frame, predictions)
+                out.write(annotated)
+            except Exception as e:
+                print(f"Error processing frame: {e}")
+                out.write(frame)
+            
+            cv2.imshow('Video Processing', annotated)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
-            frame_count += 1
-
-            # Detect plastic bags
-            annotated_frame, detection_count = self.detect_plastic_bags(frame)
-            total_detections += detection_count
-
-            # Write frame to output video
-            out.write(annotated_frame)
-
-            # Display progress
-            if frame_count % 30 == 0:
-                print(f"Processed {frame_count} frames...")
-
-        # Release resources
         cap.release()
         out.release()
         cv2.destroyAllWindows()
+        print(f"Saved to {output_path}")
 
-        print(f"Video processing completed!")
-        print(f"Total frames: {frame_count}")
-        print(f"Total plastic bag detections: {total_detections}")
-        print(f"Output saved as: {output_path}")
+    def run_image_detection(self, image_path):
+        """Run detection on a single image."""
+        path = Path(image_path)
+        if not path.exists():
+            print(f"Image not found: {path}")
+            return
 
+        image = cv2.imread(str(path))
+        if image is None:
+            print(f"Failed to load image")
+            return
+
+        try:
+            result = self.client.infer(image, model_id=self.model_id)
+            predictions = result.get("predictions", [])
+            annotated = self._draw_predictions(image, predictions)
+            
+            output_path = path.with_stem(path.stem + "_v2_detected")
+            cv2.imwrite(str(output_path), annotated)
+            print(f"Saved to {output_path}")
+            print(f"Found {len(predictions)} objects")
+        except Exception as e:
+            print(f"Error: {e}")
 
 def main():
-    """
-    Main function to run plastic bag detection
-    """
-    print("=== Plastic Bag Detection System ===")
-    print("1. Train model first using: python train.py")
-    print("2. Run detection after training is complete")
-    print()
-
-    detector = PlasticBagDetector()
-
-    # Ask user for input source
-    print("Choose input source:")
-    print("1. Webcam (live detection)")
-    print("2. Video file")
-
-    choice = input("Enter choice (1 or 2): ").strip()
-
+    print("=== Plastic Bag Detection V2 (Smooth) ===")
+    detector = PlasticBagDetectorV2()
+    
+    print("1. Webcam (Live)")
+    print("2. Video File")
+    print("3. Image File")
+    
+    choice = input("Choice (1-3): ").strip()
+    
     if choice == '1':
         detector.run_webcam_detection()
     elif choice == '2':
-        video_path = input("Enter video file path: ").strip()
-        detector.run_video_detection(video_path)
+        path = input("Video path: ").strip()
+        detector.run_video_detection(path)
+    elif choice == '3':
+        path = input("Image path: ").strip()
+        detector.run_image_detection(path)
     else:
-        print("Invalid choice. Running webcam detection by default...")
         detector.run_webcam_detection()
-
 
 if __name__ == "__main__":
     main()
